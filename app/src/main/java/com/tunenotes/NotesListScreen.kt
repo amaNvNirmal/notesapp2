@@ -156,6 +156,7 @@ private fun Header(count: Int, query: String, onQuery: (String) -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SearchField(query: String, onQuery: (String) -> Unit) {
     Surface(
@@ -215,108 +216,4 @@ private fun EmptyState(searching: Boolean) {
     Column(
         Modifier
             .fillMaxWidth()
-            .padding(top = 72.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text("🎧", fontSize = 44.sp)
-        Spacer(Modifier.height(12.dp))
-        Text(
-            if (searching) "Nothing found" else "No notes yet",
-            fontSize = 18.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onBackground
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            if (searching) "Try a different word" else "Tap New note, paste a YouTube link,\nand write while it plays.",
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun NoteCard(note: Note, onClick: () -> Unit, onLongClick: () -> Unit) {
-    val tint = remember(note.id) { Tints[abs(note.id.hashCode()) % Tints.size] }
-    val cardColor = tint.copy(alpha = 0.14f).compositeOver(MaterialTheme.colorScheme.surfaceVariant)
-    val shape = RoundedCornerShape(24.dp)
-
-    Surface(
-        shape = shape,
-        color = cardColor,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(shape)
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-    ) {
-        Column(Modifier.padding(16.dp)) {
-            if (note.pinned) {
-                Icon(
-                    Icons.Default.Star,
-                    contentDescription = "Pinned",
-                    tint = tint,
-                    modifier = Modifier
-                        .size(16.dp)
-                )
-                Spacer(Modifier.height(6.dp))
-            }
-            Text(
-                note.title.ifBlank { "Untitled" },
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            if (note.body.isNotBlank()) {
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    note.body.trim(),
-                    fontSize = 14.sp,
-                    lineHeight = 20.sp,
-                    maxLines = 6,
-                    overflow = TextOverflow.Ellipsis,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            if (note.musicUrl.isNotBlank()) {
-                Spacer(Modifier.height(12.dp))
-                MusicChip(note)
-            }
-        }
-    }
-}
-
-@Composable
-private fun MusicChip(note: Note) {
-    Row(
-        Modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
-            .padding(5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        AsyncImage(
-            model = note.thumbUrl,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .size(26.dp)
-                .clip(RoundedCornerShape(9.dp))
-                .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(
-            note.musicTitle.ifBlank { "YouTube audio" },
-            fontSize = 12.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier
-                .weight(1f, fill = false)
-                .padding(end = 8.dp)
-        )
-    }
-}
+            .padding(top =
