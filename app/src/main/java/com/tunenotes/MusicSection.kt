@@ -1,7 +1,17 @@
 package com.tunenotes
 
+import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.view.ViewGroup
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -14,7 +24,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -38,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -62,13 +72,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.PlayerConstants
-import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.YouTubePlayer
-import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.listeners.AbstractYouTubePlayerListener
-import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.options.IFramePlayerOptions
-import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.views.YouTubePlayerView
+import androidx.compose.foundation.layout.height
 import kotlin.math.max
+
+/**
+ * YouTube only plays embedded videos for pages that identify themselves with a real
+ * https origin (otherwise it answers with errors 152/153). We load our own tiny player
+ * page with this app-specific origin.
+ */
+private const val PLAYER_ORIGIN = "https://com.tunenotes"
 
 /** The music block of a note: a paste field when empty, a player once a link is set. */
 @Composable
@@ -158,65 +170,125 @@ private fun LinkInput(onUrl: (String) -> Unit) {
     }
 }
 
+/** Receives events from the player page's JavaScript and forwards them on the main thread. */
+class PlayerBridge(private val handler: (String, String) -> Unit) {
+    private val main = Handler(Looper.getMainLooper())
+
+    @JavascriptInterface
+    fun onEvent(type: String, value: String) {
+        main.post { handler(type, value) }
+    }
+}
+
+private fun playerHtml(videoId: String): String = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #p { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="p"></div>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+  var player = null;
+  function post(t, v) { try { Bridge.onEvent(t, String(v)); } catch (e) {} }
+  function onYouTubeIframeAPIReady() {
+    player = new YT.Player('p', {
+      videoId: '__ID__',
+      playerVars: {
+        controls: 0, playsinline: 1, rel: 0, fs: 0, disablekb: 1,
+        iv_load_policy: 3, origin: '__ORIGIN__', widget_referrer: '__ORIGIN__'
+      },
+      events: {
+        onReady: function () { post('ready', player.getDuration()); },
+        onStateChange: function (e) {
+          post('state', e.data);
+          if (e.data === 1 || e.data === 3) { post('duration', player.getDuration()); }
+        },
+        onError: function (e) { post('error', e.data); }
+      }
+    });
+  }
+  setInterval(function () {
+    try {
+      if (player && typeof player.getCurrentTime === 'function') {
+        post('time', player.getCurrentTime());
+      }
+    } catch (e) {}
+  }, 250);
+</script>
+</body>
+</html>
+""".trimIndent().replace("__ID__", videoId).replace("__ORIGIN__", PLAYER_ORIGIN)
+
+@SuppressLint("SetJavaScriptEnabled")
+private fun createPlayerWebView(context: Context, videoId: String, bridge: PlayerBridge): WebView =
+    WebView(context).apply {
+        setBackgroundColor(android.graphics.Color.BLACK)
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.mediaPlaybackRequiresUserGesture = false
+        webChromeClient = WebChromeClient()
+        webViewClient = object : WebViewClient() {
+            // Keep the page itself from ever navigating away (e.g. a tap on the YouTube logo).
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+                request.isForMainFrame
+        }
+        addJavascriptInterface(bridge, "Bridge")
+        loadDataWithBaseURL(PLAYER_ORIGIN, playerHtml(videoId), "text/html", "utf-8", null)
+    }
+
 @Composable
 private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     val colors = MaterialTheme.colorScheme
 
-    var player by remember(videoId) { mutableStateOf<YouTubePlayer?>(null) }
     var playing by remember(videoId) { mutableStateOf(false) }
     var position by remember(videoId) { mutableFloatStateOf(0f) }
     var duration by remember(videoId) { mutableFloatStateOf(0f) }
     var scrubbing by remember(videoId) { mutableStateOf(false) }
     var scrubTo by remember(videoId) { mutableFloatStateOf(0f) }
-    var failed by remember(videoId) { mutableStateOf(false) }
+    var errorCode by remember(videoId) { mutableIntStateOf(0) }
     var compact by rememberSaveable { mutableStateOf(false) }
 
-    val playerView = remember(videoId) {
-        YouTubePlayerView(context).apply {
-            enableAutomaticInitialization = false
-            enableBackgroundPlayback(true)
-            val options = IFramePlayerOptions.Builder().controls(0).build()
-            initialize(object : AbstractYouTubePlayerListener() {
-                override fun onReady(youTubePlayer: YouTubePlayer) {
-                    player = youTubePlayer
-                    youTubePlayer.cueVideo(videoId, 0f)
+    val webView = remember(videoId) {
+        val bridge = PlayerBridge { type, value ->
+            when (type) {
+                "state" -> {
+                    val s = value.toIntOrNull() ?: -2
+                    playing = s == 1 || s == 3
+                    if (s == 0) position = 0f
                 }
+                "time" -> value.toFloatOrNull()?.let { position = it }
+                "duration", "ready" -> value.toFloatOrNull()?.let { if (it > 0f) duration = it }
+                "error" -> errorCode = value.toIntOrNull() ?: -1
+            }
+        }
+        createPlayerWebView(context, videoId, bridge)
+    }
 
-                override fun onStateChange(
-                    youTubePlayer: YouTubePlayer,
-                    state: PlayerConstants.PlayerState
-                ) {
-                    playing = state == PlayerConstants.PlayerState.PLAYING ||
-                        state == PlayerConstants.PlayerState.BUFFERING
-                    if (state == PlayerConstants.PlayerState.ENDED) position = 0f
-                }
-
-                override fun onCurrentSecond(youTubePlayer: YouTubePlayer, second: Float) {
-                    position = second
-                }
-
-                override fun onVideoDuration(youTubePlayer: YouTubePlayer, duration2: Float) {
-                    duration = duration2
-                }
-
-                override fun onError(
-                    youTubePlayer: YouTubePlayer,
-                    error: PlayerConstants.PlayerError
-                ) {
-                    failed = true
-                }
-            }, true, options)
+    DisposableEffect(webView) {
+        onDispose {
+            (webView.parent as? ViewGroup)?.removeView(webView)
+            webView.stopLoading()
+            webView.destroy()
         }
     }
 
-    DisposableEffect(playerView) {
-        lifecycleOwner.lifecycle.addObserver(playerView)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(playerView)
-            playerView.release()
-        }
+    fun run(js: String) {
+        webView.evaluateJavascript(js, null)
+    }
+
+    val errorText: String? = when (errorCode) {
+        0 -> null
+        101, 150 -> "The video's owner doesn't allow it to play in other apps."
+        100 -> "This video is private or has been removed."
+        152, 153 -> "YouTube blocked the player (error $errorCode)."
+        else -> "Couldn't play this video (error $errorCode)."
     }
 
     Surface(
@@ -226,7 +298,7 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(Modifier.padding(12.dp)) {
-            // Video surface (YouTube's embedded player; controls are replaced by the ones below)
+            // Video surface (YouTube's embedded player; its own controls are replaced by ours)
             Box(
                 Modifier
                     .then(if (compact) Modifier.width(200.dp) else Modifier.fillMaxWidth())
@@ -234,7 +306,7 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
                     .clip(RoundedCornerShape(18.dp))
                     .background(Color.Black)
             ) {
-                AndroidView(factory = { playerView }, modifier = Modifier.fillMaxSize())
+                AndroidView(factory = { webView }, modifier = Modifier.fillMaxSize())
             }
 
             // Title row
@@ -277,13 +349,13 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
                 }
             }
 
-            if (failed) {
+            if (errorText != null) {
                 Row(
                     Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        "This video can't be played inside other apps.",
+                        errorText,
                         fontSize = 13.sp,
                         color = colors.error,
                         modifier = Modifier
@@ -307,7 +379,7 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
                         scrubTo = it
                     },
                     onValueChangeFinished = {
-                        player?.seekTo(scrubTo)
+                        run("if (window.player && player.seekTo) { player.seekTo($scrubTo, true); }")
                         position = scrubTo
                         scrubbing = false
                     },
@@ -337,7 +409,8 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     TextButton(onClick = {
-                        player?.seekTo((position - 10f).coerceAtLeast(0f))
+                        val target = (position - 10f).coerceAtLeast(0f)
+                        run("if (window.player && player.seekTo) { player.seekTo($target, true); }")
                     }) { Text("−10s", color = colors.onSurfaceVariant) }
 
                     Spacer(Modifier.width(12.dp))
@@ -350,7 +423,11 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
                                 Brush.linearGradient(listOf(colors.primary, colors.secondary))
                             )
                             .clickable {
-                                if (playing) player?.pause() else player?.play()
+                                if (playing) {
+                                    run("if (window.player && player.pauseVideo) { player.pauseVideo(); }")
+                                } else {
+                                    run("if (window.player && player.playVideo) { player.playVideo(); }")
+                                }
                             },
                         contentAlignment = Alignment.Center
                     ) {
@@ -360,8 +437,9 @@ private fun PlayerCard(note: Note, videoId: String, onClear: () -> Unit) {
                     Spacer(Modifier.width(12.dp))
 
                     TextButton(onClick = {
-                        val target = position + 10f
-                        player?.seekTo(if (duration > 0f) target.coerceAtMost(duration) else target)
+                        val raw = position + 10f
+                        val target = if (duration > 0f) raw.coerceAtMost(duration) else raw
+                        run("if (window.player && player.seekTo) { player.seekTo($target, true); }")
                     }) { Text("+10s", color = colors.onSurfaceVariant) }
                 }
             }
